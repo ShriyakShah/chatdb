@@ -1,30 +1,15 @@
 import os
-import base64
 from flask import Flask, render_template, request, jsonify
-from openai import OpenAI
 from datetime import datetime
 from dotenv import load_dotenv
+import requests
 
-# Load a local .env file if it exists
 load_dotenv()
 
 app = Flask(__name__)
 
-# Replace with your production domain after setting it up
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:5000")
 SITE_NAME = "AI Camera OCR & Saver"
-
-def get_openai_client():
-    # Fetch OpenRouter key or standard key securely
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        # Fallback to dummy key to avoid validation crash during app boot
-        api_key = "DUMMY_KEY_FOR_BOOT"
-    
-    return OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
 
 @app.route('/')
 def index():
@@ -32,12 +17,14 @@ def index():
 
 @app.route('/process', methods=['POST'])
 def process_image():
-    # Check if the API Key actually exists at request time
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return jsonify({
-            'error': 'OPENROUTER_API_KEY is missing. Please add it to your environment variables on Render.'
-        }), 500
+    # Verify environment variables
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    ocr_space_key = os.environ.get("OCR_SPACE_API_KEY")
+    
+    if not openrouter_key:
+        return jsonify({'error': 'OPENROUTER_API_KEY is missing in Render settings.'}), 500
+    if not ocr_space_key:
+        return jsonify({'error': 'OCR_SPACE_API_KEY is missing in Render settings.'}), 500
 
     if 'image' not in request.files:
         return jsonify({'error': 'No image file uploaded'}), 400
@@ -46,46 +33,99 @@ def process_image():
     if image_file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
+    raw_text = ""
+
+    # --- STEP 1: Process Image via OCR.space ---
     try:
-        # Read the image file and convert to a base64 string
-        image_bytes = image_file.read()
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        mime_type = image_file.content_type or "image/jpeg"
-
-        # Instantiate client lazily
-        client = get_openai_client()
-
-        # Call OpenRouter using the Nvidia Nemotron Omni free model
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Extract all readable text from this image. Correct spelling errors and grammatical issues, structure it cleanly, and output ONLY the corrected final text. Do not include any introduction, comments, or summaries."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            extra_headers={
-                "HTTP-Referer": SITE_URL,
-                "X-Title": SITE_NAME,
-            }
+        image_file.seek(0)
+        
+        payload = {
+            'apikey': ocr_space_key,
+            'language': 'eng',
+            'isOverlayRequired': False
+        }
+        
+        files = {
+            'file': (image_file.filename, image_file.read(), image_file.content_type)
+        }
+        
+        ocr_response = requests.post(
+            'https://api.ocr.space/parse/image',
+            files=files,
+            data=payload,
+            timeout=30
         )
-
-        extracted_text = response.choices[0].message.content
-        return jsonify({'text': extracted_text})
+        
+        if ocr_response.status_code != 200:
+            return jsonify({'error': f"OCR.space returned HTTP status {ocr_response.status_code}"}), 500
+        
+        ocr_result = ocr_response.json()
+        
+        if ocr_result.get("IsErroredOnProcessing"):
+            error_message = ocr_result.get("ErrorMessage", ["Unknown processing error"])[0]
+            return jsonify({'error': f"OCR.space Error: {error_message}"}), 500
+        
+        parsed_results = ocr_result.get("ParsedResults", [])
+        if not parsed_results:
+            return jsonify({'error': 'OCR.space did not return structured parsing results.'}), 400
+        
+        raw_text = parsed_results[0].get("ParsedText", "").strip()
+        if not raw_text:
+            return jsonify({'error': 'No text detected in the image.'}), 400
 
     except Exception as e:
-        return jsonify({'error': f"API processing failed: {str(e)}"}), 500
+        return jsonify({'error': f"OCR processing failed: {str(e)}"}), 500
+
+    # --- STEP 2: Refine Extracted Text via OpenRouter (Direct HTTP Post) ---
+    try:
+        headers = {
+            "Authorization": f"Bearer {openrouter_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": SITE_URL,
+            "X-Title": SITE_NAME,
+        }
+        
+        # Format prompt to clean up the raw OCR text
+        prompt = (
+            "The following text is raw output from an OCR tool. Please clean it up, "
+            "correct formatting, spacing, grammar, and spelling mistakes, and return only "
+            "the final cleaned text. Do not write any introduction, commentary, or extra explanations.\n\n"
+            f"Raw text:\n{raw_text}"
+        )
+        
+        json_data = {
+            "model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        
+        ai_response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=json_data,
+            timeout=30
+        )
+        
+        if ai_response.status_code != 200:
+            raise Exception(f"OpenRouter API returned HTTP status {ai_response.status_code}")
+            
+        ai_result = ai_response.json()
+        
+        # Extract the content from OpenRouter's response structure
+        choices = ai_result.get("choices", [])
+        if not choices:
+            raise Exception("No choices returned from OpenRouter response.")
+            
+        refined_text = choices[0].get("message", {}).get("content", "").strip()
+        return jsonify({'text': refined_text})
+
+    except Exception as e:
+        # Fallback to returning raw text if the OpenRouter AI call encounters an issue
+        return jsonify({
+            'text': f"[AI Cleanup failed. Presenting raw text fallback]\n\n{raw_text}",
+            'warning': f"OpenRouter refinement failed: {str(e)}"
+        })
 
 @app.route('/save', methods=['POST'])
 def save_text():
@@ -96,11 +136,9 @@ def save_text():
         return jsonify({'error': 'No text provided to save'}), 400
 
     try:
-        # Generate timestamped filename for uniqueness
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"saved_text_{timestamp}.txt"
         
-        # Save to local directory on the server
         current_dir = os.path.dirname(os.path.abspath(__file__))
         filepath = os.path.join(current_dir, filename)
         
