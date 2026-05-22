@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Camera OCR & Saver</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 700px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f7f9fa;
+            color: #333;
+        }
+        .container {
+            background: #ffffff;
+            padding: 25px;
+            border-radius: 10px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 25px;
+        }
+        .upload-area {
+            border: 2px dashed #3498db;
+            border-radius: 8px;
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            background: #fcfdfd;
+            transition: background 0.2s ease;
+        }
+        .upload-area:hover {
+            background: #f0f7fc;
+        }
+        #imageInput {
+            display: none;
+        }
+        #preview {
+            max-width: 100%;
+            max-height: 250px;
+            margin-top: 15px;
+            border-radius: 6px;
+            display: none;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 12px;
+            font-size: 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 15px;
+            transition: background 0.2s;
+        }
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        .btn:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        .status-message {
+            text-align: center;
+            margin-top: 15px;
+            font-weight: 500;
+            color: #7f8c8d;
+        }
+        #resultContainer {
+            margin-top: 30px;
+            display: none;
+        }
+        textarea {
+            width: 100%;
+            height: 200px;
+            padding: 12px;
+            border: 1px solid #ccd1d9;
+            border-radius: 6px;
+            font-size: 15px;
+            line-height: 1.5;
+            box-sizing: border-box;
+            resize: vertical;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .btn-half {
+            flex: 1;
+            margin-top: 0;
+        }
+        .success-banner {
+            background-color: #d4edda;
+            color: #155724;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+            margin-top: 15px;
+            display: none;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>AI Camera OCR</h1>
+    
+    <div class="upload-area" onclick="document.getElementById('imageInput').click()">
+        <p style="margin: 0; font-size: 16px; color: #555;">Tap here to take a photo or select an image</p>
+        <input type="file" id="imageInput" accept="image/*" capture="environment">
+        <img id="preview" alt="Selected preview">
+    </div>
+
+    <button id="processBtn" class="btn" disabled>Extract & Refine with AI</button>
+    <div id="status" class="status-message"></div>
+
+    <div id="resultContainer">
+        <h3 style="color: #2c3e50; margin-bottom: 10px;">AI Extracted Text (You can edit this):</h3>
+        <textarea id="outputTextArea"></textarea>
+        
+        <div class="button-group">
+            <button id="saveBtn" class="btn btn-half" style="background-color: #2ecc71;">Save to Server</button>
+            <button id="downloadBtn" class="btn btn-half" style="background-color: #9b59b6;">Download to Device</button>
+        </div>
+        
+        <div id="successBanner" class="success-banner"></div>
+    </div>
+</div>
+
+<script>
+    const imageInput = document.getElementById('imageInput');
+    const preview = document.getElementById('preview');
+    const processBtn = document.getElementById('processBtn');
+    const status = document.getElementById('status');
+    const resultContainer = document.getElementById('resultContainer');
+    const outputTextArea = document.getElementById('outputTextArea');
+    const saveBtn = document.getElementById('saveBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const successBanner = document.getElementById('successBanner');
+
+    let selectedFile = null;
+
+    imageInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            selectedFile = file;
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                preview.src = event.target.result;
+                preview.style.display = 'block';
+            };
+            reader.readAsDataURL(file);
+            
+            processBtn.disabled = false;
+            status.textContent = "";
+            resultContainer.style.display = 'none';
+            successBanner.style.display = 'none';
+        }
+    });
+
+    processBtn.addEventListener('click', async () => {
+        if (!selectedFile) return;
+
+        const formData = new FormData();
+        formData.append('image', selectedFile);
+
+        status.textContent = "Processing image using OpenRouter...";
+        processBtn.disabled = true;
+
+        try {
+            const response = await fetch('/process', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                status.textContent = "Done!";
+                outputTextArea.value = data.text;
+                resultContainer.style.display = 'block';
+            } else {
+                status.textContent = "Error: " + (data.error || "Failed.");
+            }
+        } catch (err) {
+            status.textContent = "Server connection failed.";
+            console.error(err);
+        } finally {
+            processBtn.disabled = false;
+        }
+    });
+
+    // Save File to the Server
+    saveBtn.addEventListener('click', async () => {
+        const textContent = outputTextArea.value;
+        if (!textContent.trim()) return;
+
+        saveBtn.disabled = true;
+        successBanner.style.display = 'none';
+
+        try {
+            const response = await fetch('/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: textContent })
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+                successBanner.textContent = `File saved on server as "${data.filename}"!`;
+                successBanner.style.display = 'block';
+            } else {
+                alert("Error saving: " + data.error);
+            }
+        } catch (err) {
+            alert("Error communicating with server.");
+        } finally {
+            saveBtn.disabled = false;
+        }
+    });
+
+    // Download File Directly to User's Device (Browser Fallback)
+    downloadBtn.addEventListener('click', () => {
+        const textContent = outputTextArea.value;
+        if (!textContent.trim()) return;
+
+        const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        link.href = url;
+        link.download = `extracted_text_${timestamp}.txt`;
+        link.click();
+        
+        URL.revokeObjectURL(url);
+    });
+</script>
+
+</body>
+</html>
