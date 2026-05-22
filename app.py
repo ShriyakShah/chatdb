@@ -1,8 +1,10 @@
 import os
+import io
 from flask import Flask, render_template, request, jsonify
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
+from PIL import Image
 
 load_dotenv()
 
@@ -10,6 +12,41 @@ app = Flask(__name__)
 
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:5000")
 SITE_NAME = "AI Camera OCR & Saver"
+
+def compress_image_to_limit(image_file, max_size_bytes=1000000):
+    """
+    Opens an image using Pillow, scales it down to maximum 2000px dimension
+    (which is optimal for OCR), and compresses it to a JPEG under 1MB.
+    """
+    image_file.seek(0)
+    img = Image.open(image_file)
+    
+    # Convert RGBA/Palette images to standard RGB (JPEGs don't support alpha transparency)
+    if img.mode in ('RGBA', 'P', 'LA'):
+        img = img.convert('RGB')
+    
+    # Scale down dimensions if the photo is extremely large (e.g. 4000px+ from high-end cameras)
+    # 2000px is more than enough resolution for OCR processing
+    max_dimension = 2000
+    width, height = img.size
+    if max(width, height) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    
+    # Progressively test lower compression qualities until size is under 1MB
+    for quality in [85, 70, 50, 30]:
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        size = buffer.tell()
+        if size <= max_size_bytes:
+            buffer.seek(0)
+            return buffer.getvalue(), "image/jpeg", "compressed_image.jpg"
+            
+    # Ultimate fallback: aggressively scale down image if still too large
+    img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=30, optimize=True)
+    buffer.seek(0)
+    return buffer.getvalue(), "image/jpeg", "compressed_image.jpg"
 
 @app.route('/')
 def index():
@@ -35,10 +72,22 @@ def process_image():
 
     raw_text = ""
 
-    # --- STEP 1: Process Image via OCR.space ---
+    # --- STEP 1: Process Image (with compression fallback) ---
     try:
+        # Determine the raw file size in bytes
+        image_file.seek(0, os.SEEK_END)
+        file_size = image_file.tell()
         image_file.seek(0)
-        
+
+        # If the file is larger than 1MB, compress it
+        if file_size > 1000000:
+            file_content, content_type, filename = compress_image_to_limit(image_file)
+        else:
+            file_content = image_file.read()
+            content_type = image_file.content_type
+            filename = image_file.filename
+
+        # Send image data to OCR.space API
         payload = {
             'apikey': ocr_space_key,
             'language': 'eng',
@@ -46,7 +95,7 @@ def process_image():
         }
         
         files = {
-            'file': (image_file.filename, image_file.read(), image_file.content_type)
+            'file': (filename, file_content, content_type)
         }
         
         ocr_response = requests.post(
@@ -76,7 +125,7 @@ def process_image():
     except Exception as e:
         return jsonify({'error': f"OCR processing failed: {str(e)}"}), 500
 
-    # --- STEP 2: Refine Extracted Text via OpenRouter (Direct HTTP Post) ---
+    # --- STEP 2: Refine Extracted Text via OpenRouter ---
     try:
         headers = {
             "Authorization": f"Bearer {openrouter_key}",
@@ -85,7 +134,6 @@ def process_image():
             "X-Title": SITE_NAME,
         }
         
-        # Format prompt to clean up the raw OCR text
         prompt = (
             "The following text is raw output from an OCR tool. Please clean it up, "
             "correct formatting, spacing, grammar, and spelling mistakes, and return only "
@@ -111,8 +159,6 @@ def process_image():
             raise Exception(f"OpenRouter API returned HTTP status {ai_response.status_code}")
             
         ai_result = ai_response.json()
-        
-        # Extract the content from OpenRouter's response structure
         choices = ai_result.get("choices", [])
         if not choices:
             raise Exception("No choices returned from OpenRouter response.")
@@ -121,7 +167,6 @@ def process_image():
         return jsonify({'text': refined_text})
 
     except Exception as e:
-        # Fallback to returning raw text if the OpenRouter AI call encounters an issue
         return jsonify({
             'text': f"[AI Cleanup failed. Presenting raw text fallback]\n\n{raw_text}",
             'warning': f"OpenRouter refinement failed: {str(e)}"
