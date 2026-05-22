@@ -3,18 +3,28 @@ import base64
 from flask import Flask, render_template, request, jsonify
 from openai import OpenAI
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load a local .env file if it exists
+load_dotenv()
 
 app = Flask(__name__)
-
-# Direct the OpenAI SDK to use OpenRouter's URL
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ.get("OPENROUTER_API_KEY"),
-)
 
 # Replace with your production domain after setting it up
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:5000")
 SITE_NAME = "AI Camera OCR & Saver"
+
+def get_openai_client():
+    # Fetch OpenRouter key or standard key securely
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        # Fallback to dummy key to avoid validation crash during app boot
+        api_key = "DUMMY_KEY_FOR_BOOT"
+    
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
 
 @app.route('/')
 def index():
@@ -22,6 +32,13 @@ def index():
 
 @app.route('/process', methods=['POST'])
 def process_image():
+    # Check if the API Key actually exists at request time
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return jsonify({
+            'error': 'OPENROUTER_API_KEY is missing. Please add it to your environment variables on Render.'
+        }), 500
+
     if 'image' not in request.files:
         return jsonify({'error': 'No image file uploaded'}), 400
     
@@ -30,12 +47,15 @@ def process_image():
         return jsonify({'error': 'No selected file'}), 400
 
     try:
-        # Read the image file and convert it into a base64 string
+        # Read the image file and convert to a base64 string
         image_bytes = image_file.read()
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         mime_type = image_file.content_type or "image/jpeg"
 
-        # Calling OpenRouter using the Nvidia Nemotron Omni free model
+        # Instantiate client lazily
+        client = get_openai_client()
+
+        # Call OpenRouter using the Nvidia Nemotron Omni free model
         response = client.chat.completions.create(
             model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
             messages=[
@@ -65,7 +85,7 @@ def process_image():
         return jsonify({'text': extracted_text})
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f"API processing failed: {str(e)}"}), 500
 
 @app.route('/save', methods=['POST'])
 def save_text():
